@@ -5,7 +5,7 @@ import { ccf } from "@microsoft/ccf-app/global";
 import * as ccfapp from "@microsoft/ccf-app";
 import { ServiceResult } from "../utils/ServiceResult";
 import { IWrapped, KeyWrapper } from "./KeyWrapper";
-import { ISnpAttestation } from "../attestation/ISnpAttestation";
+import { ISnpAttestation, AttestationProvider } from "../attestation/ISnpAttestation";
 import { enableEndpoint, isPemPublicKey } from "../utils/Tooling";
 import { IAttestationReport } from "../attestation/ISnpAttestationReport";
 import { IKeyItem } from "./IKeyItem";
@@ -23,6 +23,7 @@ enableEndpoint();
 export interface IKeyRequest {
   attestation: ISnpAttestation;
   wrappingKey?: string;
+  attestationType?: AttestationProvider;
 }
 
 export interface IKeyResponse {
@@ -133,6 +134,8 @@ export const key = (
   const [_, isValidIdentity] = serviceRequest.isAuthenticated();
   if (isValidIdentity.failure) return isValidIdentity;
 
+  const attestationProvider: AttestationProvider = serviceRequest.body["attestationType"] || "azure";
+
   let kid = serviceRequest.query?.["kid"];
   let id: number | undefined;
   if (kid === undefined) {
@@ -159,7 +162,7 @@ export const key = (
 
   let validateAttestationResult: ServiceResult<string | IAttestationReport>;
   try {
-    validateAttestationResult = validateAttestation(attestation);
+    validateAttestationResult = validateAttestation(attestation, attestationProvider);
     if (!validateAttestationResult.success) {
       return ServiceResult.Failed<string>(
         validateAttestationResult.error!,
@@ -306,6 +309,8 @@ export const unwrapKey = (
   const wrappingKeyHash = KeyGeneration.calculateHexHash(wrappingKeyBuf);
   Logger.debug(`unwrapKey->wrapping key hash: ${wrappingKeyHash}`);
 
+  const attestationProvider: AttestationProvider = serviceRequest.body["attestationType"] || "azure";
+
   const fmt = serviceRequest.query?.["fmt"] || "jwk";
   if (!(fmt === "jwk" || fmt === "tink")) {
     const diagnosticHeaders = {
@@ -325,7 +330,7 @@ export const unwrapKey = (
   // Validate attestation
   let validateAttestationResult: ServiceResult<string | IAttestationReport>;
   try {
-    validateAttestationResult = validateAttestation(attestation);
+    validateAttestationResult = validateAttestation(attestation, attestationProvider);
     if (!validateAttestationResult.success) {
       const diagnosticHeaders = {
         "x-ms-kms-error-code": "ATTESTATION_VALIDATION_FAILED",
