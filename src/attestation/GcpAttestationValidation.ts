@@ -1,126 +1,97 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-import * as ccfapp from "@microsoft/ccf-app";
-import { snp_attestation } from "@microsoft/ccf-app/global";
 import { ServiceResult } from "../utils/ServiceResult";
 import { IAttestationReport } from "./ISnpAttestationReport";
-import { ISnpAttestation } from "./ISnpAttestation";
-import { Base64 } from "js-base64";
-import { SnpAttestationClaims } from "./SnpAttestationClaims";
 import { gcpKeyReleasePolicyMap } from "../repositories/Maps";
 import { KeyReleasePolicy } from "../policies/KeyReleasePolicy";
 import { Logger, LogContext } from "../utils/Logger";
 
 /**
- * Validates a GCP Confidential VM SNP attestation against the GCP key release policy.
+ * Validates a GCP Confidential Space workload against the GCP key release policy.
  *
- * GCP Confidential VMs use AMD SEV-SNP hardware. The attestation fields (evidence,
- * endorsements, uvm_endorsements, endorsed_tcb) follow the same binary format as Azure
- * SNP attestation. Validation is identical to the Azure path except that claims are
- * checked against gcpKeyReleasePolicyMap, which should be populated with the
- * GCP_VCPU_MEASUREMENTS values via the set_gcp_key_release_policy governance action.
+ * Unlike Azure Confidential VMs, GCP Confidential Space does NOT expose a raw
+ * AMD SEV-SNP report (with endorsements / uvm_endorsements) to the workload.
+ * The hardware-rooted attestation is delivered as the
+ * `confidentialcomputing.googleapis.com` OIDC JWT. That token is already
+ * cryptographically validated by the CCF `jwt` auth policy (issuer + signing
+ * key registered at the governance level) before this code runs, so we
+ * authorize key release on the JWT claims rather than on
+ * `snp_attestation.verifySnpAttestation()`.
+ *
+ * The relevant Confidential Space claims are flattened into the same flat
+ * claim dictionary consumed by `KeyReleasePolicy.validateKeyReleasePolicy`,
+ * and checked against `gcpKeyReleasePolicyMap` (populated via the
+ * `set_gcp_key_release_policy` governance action with Confidential Space claim
+ * keys, not `x-ms-sevsnpvm-*`).
  */
+const extractGcpClaims = (payload: {
+  [key: string]: any;
+}): IAttestationReport => {
+  const claims: IAttestationReport = {};
+  const set = (key: string, value: any) => {
+    if (value === undefined || value === null) return;
+    // Policy comparison is string/number based; collapse arrays to a scalar.
+    claims[key] = Array.isArray(value) ? value.join(",") : value;
+  };
+
+  // Top-level Confidential Space token claims.
+  set("iss", payload.iss);
+  set("swname", payload.swname); // "CONFIDENTIAL_SPACE"
+  set(
+    "swversion",
+    Array.isArray(payload.swversion) ? payload.swversion[0] : payload.swversion,
+  );
+  set("hwmodel", payload.hwmodel); // e.g. "GCP_AMD_SEV"
+  set("oemid", payload.oemid);
+  set("dbgstat", payload.dbgstat); // e.g. "disabled-since-boot"
+  set("secboot", payload.secboot);
+
+  // Workload container claims (submods.container).
+  const container = payload.submods?.container;
+  if (container) {
+    set("image_digest", container.image_digest); // "sha256:..."
+    set("image_reference", container.image_reference);
+    set("restart_policy", container.restart_policy);
+  }
+
+  // Confidential Space support attributes (submods.confidential_space).
+  const cs = payload.submods?.confidential_space;
+  if (cs) {
+    set("support_attributes", cs.support_attributes);
+  }
+
+  return claims;
+};
+
 export const validateGcpAttestation = (
-  attestation: ISnpAttestation,
+  jwtClaims: { [key: string]: any } | undefined,
+  logContextIn?: LogContext,
 ): ServiceResult<string | IAttestationReport> => {
-  const logContext = new LogContext().appendScope("validateGcpAttestation");
-  Logger.debug(`Start GCP attestation validation`, logContext);
+  const logContext = (
+    logContextIn?.clone() || new LogContext()
+  ).appendScope("validateGcpAttestation");
+  Logger.debug(
+    `Start GCP (Confidential Space JWT) attestation validation`,
+    logContext,
+  );
 
-  if (!attestation) {
+  if (!jwtClaims || typeof jwtClaims !== "object") {
     return ServiceResult.Failed<string>(
-      { errorMessage: "missing attestation" },
-      400,
-      logContext,
-    );
-  }
-  if (!attestation.evidence && typeof attestation.evidence !== "string") {
-    return ServiceResult.Failed<string>(
-      { errorMessage: "missing or bad attestation.evidence" },
-      400,
-      logContext,
-    );
-  }
-  if (!attestation.endorsements && typeof attestation.endorsements !== "string") {
-    return ServiceResult.Failed<string>(
-      { errorMessage: "missing or bad attestation.endorsements" },
-      400,
-      logContext,
-    );
-  }
-  if (!attestation.uvm_endorsements && typeof attestation.uvm_endorsements !== "string") {
-    return ServiceResult.Failed<string>(
-      { errorMessage: "missing or bad attestation.uvm_endorsements" },
-      400,
-      logContext,
-    );
-  }
-  if (!attestation.endorsed_tcb && typeof attestation.endorsed_tcb !== "string") {
-    return ServiceResult.Failed<string>(
-      { errorMessage: "missing or bad attestation.endorsed_tcb" },
-      400,
-      logContext,
-    );
-  }
-
-  let evidence: ArrayBuffer;
-  let endorsements: ArrayBuffer;
-  let uvm_endorsements: ArrayBuffer;
-
-  try {
-    evidence = ccfapp
-      .typedArray(Uint8Array)
-      .encode(Base64.toUint8Array(attestation.evidence) as Uint8Array<ArrayBuffer>);
-  } catch (exception: any) {
-    return ServiceResult.Failed<string>(
-      { errorMessage: "Malformed attestation.evidence" },
-      400,
-      logContext,
-    );
-  }
-  try {
-    endorsements = ccfapp
-      .typedArray(Uint8Array)
-      .encode(Base64.toUint8Array(attestation.endorsements) as Uint8Array<ArrayBuffer>);
-  } catch (exception: any) {
-    return ServiceResult.Failed<string>(
-      { errorMessage: "Malformed attestation.endorsements" },
-      400,
-      logContext,
-    );
-  }
-  try {
-    uvm_endorsements = ccfapp
-      .typedArray(Uint8Array)
-      .encode(Base64.toUint8Array(attestation.uvm_endorsements) as Uint8Array<ArrayBuffer>);
-  } catch (exception: any) {
-    return ServiceResult.Failed<string>(
-      { errorMessage: "Malformed attestation.uvm_endorsements" },
+      { errorMessage: "missing GCP Confidential Space JWT claims" },
       400,
       logContext,
     );
   }
 
   try {
-    const endorsed_tcb = attestation.endorsed_tcb;
-
-    const attestationReport = snp_attestation.verifySnpAttestation(
-      evidence,
-      endorsements,
-      uvm_endorsements,
-      endorsed_tcb,
-    );
-    Logger.debug(
-      `GCP attestation report: ${JSON.stringify(attestationReport)}`,
-      logContext,
-    );
-
-    const claimsProvider = new SnpAttestationClaims(attestationReport);
-    const attestationClaims = claimsProvider.getClaims();
+    const attestationClaims = extractGcpClaims(jwtClaims);
     Logger.debug(`GCP attestation claims: `, logContext, attestationClaims);
 
-    const keyReleasePolicy =
-      KeyReleasePolicy.getKeyReleasePolicyFromMap(gcpKeyReleasePolicyMap, logContext);
+    const keyReleasePolicy = KeyReleasePolicy.getKeyReleasePolicyFromMap(
+      gcpKeyReleasePolicyMap,
+      logContext,
+    );
     Logger.debug(
       `GCP key release policy: ${JSON.stringify(keyReleasePolicy)}`,
       logContext,

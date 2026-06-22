@@ -27,4 +27,8 @@ export interface IKeyReleasePolicySnpProps {
   "x-ms-sevsnpvm-tee-svn"?: number[] | number;
   "x-ms-sevsnpvm-vmpl"?: number[] | number;
   "x-ms-ver"?: string[] | string;
+  // GCP Confidential Space JWT claim keys (e.g. "swname", "hwmodel",
+  // "image_digest") are validated by the same policy engine. Typed as `any`
+  // to match the existing dynamic claim indexing in KeyReleasePolicy.
+  [key: string]: any;
 }
