@@ -119,8 +119,16 @@ export const key = (
     attestation = serviceRequest.body["attestation"];
   }
 
-  // Validate input
-  if (!serviceRequest.body || !attestation) {
+  const attestationProvider: AttestationProvider =
+    (serviceRequest.body && serviceRequest.body["attestationType"]) || "azure";
+
+  // Validate input. For GCP Confidential Space the hardware-rooted attestation
+  // is carried by the OIDC JWT (validated by the jwt auth policy), so a body
+  // `attestation` is not required.
+  if (
+    !serviceRequest.body ||
+    (attestationProvider !== "gcp" && !attestation)
+  ) {
     return ServiceResult.Failed<string>(
       {
         errorMessage: `${name}: The body is not a ${name} request: ${JSON.stringify(serviceRequest.body)}`,
@@ -134,7 +142,9 @@ export const key = (
   const [_, isValidIdentity] = serviceRequest.isAuthenticated();
   if (isValidIdentity.failure) return isValidIdentity;
 
-  const attestationProvider: AttestationProvider = serviceRequest.body["attestationType"] || "azure";
+  // GCP authorizes key release on the validated Confidential Space JWT claims.
+  const jwtClaims = (request.caller as unknown as ccfapp.JwtAuthnIdentity)?.jwt
+    ?.payload;
 
   let kid = serviceRequest.query?.["kid"];
   let id: number | undefined;
@@ -162,7 +172,11 @@ export const key = (
 
   let validateAttestationResult: ServiceResult<string | IAttestationReport>;
   try {
-    validateAttestationResult = validateAttestation(attestation, attestationProvider);
+    validateAttestationResult = validateAttestation(
+      attestation,
+      attestationProvider,
+      jwtClaims,
+    );
     if (!validateAttestationResult.success) {
       return ServiceResult.Failed<string>(
         validateAttestationResult.error!,
@@ -243,13 +257,15 @@ export const unwrapKey = (
     attestation = serviceRequest.body["attestation"];
   }
 
-  // Repeat the check wherever serviceRequest.body["attestation"] is accessed
-  if (serviceRequest.body && serviceRequest.body["attestation"]) {
-    attestation = serviceRequest.body["attestation"];
-  }
+  const attestationProvider: AttestationProvider =
+    (serviceRequest.body && serviceRequest.body["attestationType"]) || "azure";
 
-  // Validate input
-  if (!serviceRequest.body || !attestation) {
+  // Validate input. For GCP Confidential Space the hardware-rooted attestation
+  // is carried by the OIDC JWT, so a body `attestation` is not required.
+  if (
+    !serviceRequest.body ||
+    (attestationProvider !== "gcp" && !attestation)
+  ) {
     return ServiceResult.Failed<string>(
       {
         errorMessage: `${name}: The body is not a ${name} request: ${JSON.stringify(serviceRequest.body)}`,
@@ -262,6 +278,11 @@ export const unwrapKey = (
   // check if caller has a valid identity
   const [_, isValidIdentity] = serviceRequest.isAuthenticated();
   if (isValidIdentity.failure) return isValidIdentity;
+
+  // GCP authorizes key release on the validated Confidential Space JWT claims,
+  // and binds the wrapping key via the JWT nonce (see below).
+  const jwtClaims = (request.caller as unknown as ccfapp.JwtAuthnIdentity)?.jwt
+    ?.payload;
 
   // check payload
   const wrappedKid: string = serviceRequest.body["wrappedKid"];
@@ -309,8 +330,6 @@ export const unwrapKey = (
   const wrappingKeyHash = KeyGeneration.calculateHexHash(wrappingKeyBuf);
   Logger.debug(`unwrapKey->wrapping key hash: ${wrappingKeyHash}`);
 
-  const attestationProvider: AttestationProvider = serviceRequest.body["attestationType"] || "azure";
-
   const fmt = serviceRequest.query?.["fmt"] || "jwk";
   if (!(fmt === "jwk" || fmt === "tink")) {
     const diagnosticHeaders = {
@@ -330,13 +349,17 @@ export const unwrapKey = (
   // Validate attestation
   let validateAttestationResult: ServiceResult<string | IAttestationReport>;
   try {
-    validateAttestationResult = validateAttestation(attestation, attestationProvider);
+    validateAttestationResult = validateAttestation(
+      attestation,
+      attestationProvider,
+      jwtClaims,
+    );
     if (!validateAttestationResult.success) {
       const diagnosticHeaders = {
         "x-ms-kms-error-code": "ATTESTATION_VALIDATION_FAILED",
         "x-ms-kms-error-details": `status_code:${validateAttestationResult.statusCode}`,
-        "x-ms-kms-attestation-has-evidence": String(!!attestation.evidence),
-        "x-ms-kms-attestation-has-endorsements": String(!!attestation.endorsements)
+        "x-ms-kms-attestation-has-evidence": String(!!attestation?.evidence),
+        "x-ms-kms-attestation-has-endorsements": String(!!attestation?.endorsements)
       };
       return ServiceResult.Failed<string>(
         validateAttestationResult.error!,
@@ -360,21 +383,50 @@ export const unwrapKey = (
     );
   }
 
-  // Check if wrapping key match attestation
-  const reportData = validateAttestationResult.body!["x-ms-sevsnpvm-reportdata"];
-  if (!reportData.startsWith(wrappingKeyHash)) {
-    const diagnosticHeaders = {
-      "x-ms-kms-error-code": "WRAPPING_KEY_HASH_MISMATCH",
-      "x-ms-kms-error-details": `expected_prefix:${wrappingKeyHash.substring(0, 16)}...,actual_prefix:${reportData.substring(0, 16)}...`
-    };
-    return ServiceResult.Failed<string>(
-      {
-        errorMessage: `${name}:wrapping key hash ${reportData} does not match wrappingKey`,
-      },
-      400,
-      logContext,
-      diagnosticHeaders
+  // Check that the wrapping key is bound to the attested workload.
+  if (attestationProvider === "gcp") {
+    // GCP Confidential Space carries the binding in the OIDC token nonce
+    // (`eat_nonce`), which the client sets to the SHA-256 hex hash of its
+    // wrapping key. There is no SNP report_data on GCP.
+    const eatNonce =
+      (jwtClaims && (jwtClaims["eat_nonce"] ?? jwtClaims["nonce"])) ?? undefined;
+    const nonces = Array.isArray(eatNonce) ? eatNonce : [eatNonce];
+    const matched = nonces.some(
+      (n) =>
+        typeof n === "string" &&
+        n.toLowerCase() === wrappingKeyHash.toLowerCase(),
     );
+    if (!matched) {
+      const diagnosticHeaders = {
+        "x-ms-kms-error-code": "WRAPPING_KEY_NONCE_MISMATCH",
+        "x-ms-kms-error-details": `expected:${wrappingKeyHash.substring(0, 16)}...,nonce:${String(eatNonce).substring(0, 16)}...`,
+      };
+      return ServiceResult.Failed<string>(
+        {
+          errorMessage: `${name}: JWT eat_nonce does not match wrappingKey hash`,
+        },
+        400,
+        logContext,
+        diagnosticHeaders
+      );
+    }
+  } else {
+    // Azure: the binding is carried in the SNP report_data.
+    const reportData = validateAttestationResult.body!["x-ms-sevsnpvm-reportdata"];
+    if (!reportData.startsWith(wrappingKeyHash)) {
+      const diagnosticHeaders = {
+        "x-ms-kms-error-code": "WRAPPING_KEY_HASH_MISMATCH",
+        "x-ms-kms-error-details": `expected_prefix:${wrappingKeyHash.substring(0, 16)}...,actual_prefix:${reportData.substring(0, 16)}...`
+      };
+      return ServiceResult.Failed<string>(
+        {
+          errorMessage: `${name}:wrapping key hash ${reportData} does not match wrappingKey`,
+        },
+        400,
+        logContext,
+        diagnosticHeaders
+      );
+    }
   }
 
   // Be sure to request item and the receipt

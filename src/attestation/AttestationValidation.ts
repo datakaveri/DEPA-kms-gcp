@@ -19,14 +19,17 @@ import { KeyReleasePolicy } from "../policies/KeyReleasePolicy";
 
 // Validate the attestation by means of the key release policy
 export const validateAttestation = (
-  attestation: ISnpAttestation,
+  attestation: ISnpAttestation | undefined,
   attestationProvider: AttestationProvider = "azure",
+  jwtClaims?: { [key: string]: any },
 ): ServiceResult<string | IAttestationReport> => {
   const logContext = new LogContext().appendScope("validateAttestation");
   Logger.debug(`Start attestation validation (provider: ${attestationProvider})`, logContext);
 
   if (attestationProvider === "gcp") {
-    return validateGcpAttestation(attestation);
+    // GCP Confidential Space carries the hardware-rooted attestation in the
+    // OIDC JWT, not in a raw SNP report body — validate the JWT claims.
+    return validateGcpAttestation(jwtClaims, logContext);
   }
 
   if (!attestation) {

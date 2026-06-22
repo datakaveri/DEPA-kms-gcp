@@ -1,0 +1,20 @@
+{
+  "actions": [
+    {
+      "name": "set_ca_cert_bundle",
+      "args": {
+        "name": "jwt_gcp",
+        "cert_bundle": "-----BEGIN CERTIFICATE-----\nREPLACE_WITH_GTS_ROOT_R1_PEM_USED_BY_googleapis.com_TLS_CHAIN\n-----END CERTIFICATE-----\n"
+      }
+    },
+    {
+      "name": "set_jwt_issuer",
+      "args": {
+        "issuer": "https://confidentialcomputing.googleapis.com",
+        "key_filter": "all",
+        "ca_cert_bundle_name": "jwt_gcp",
+        "auto_refresh": true
+      }
+    }
+  ]
+}

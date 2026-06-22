@@ -13,32 +13,12 @@ export let action = [
         checkType(args.claims, "object");
       },
       function (args) {
+        // GCP Confidential Space OIDC token claims (flattened by
+        // GcpAttestationValidation.extractGcpClaims). These replace the Azure
+        // x-ms-sevsnpvm-* claims: GCP does not expose a raw SNP report, so the
+        // key-release policy is expressed over the Confidential Space JWT.
         const CLAIMS = {
-          "x-ms-attestation-type": "string",
-          "x-ms-compliance-status": "string",
-          "x-ms-policy-hash": "string",
-          "vm-configuration-secure-boot": "boolean",
-          "vm-configuration-secure-boot-template-id": "string",
-          "vm-configuration-tpm-enabled": "boolean",
-          "vm-configuration-vmUniqueId": "string",
-          "x-ms-sevsnpvm-authorkeydigest": "string",
-          "x-ms-sevsnpvm-bootloader-svn": "number",
-          "x-ms-sevsnpvm-familyId": "string",
-          "x-ms-sevsnpvm-guestsvn": "number",
-          "x-ms-sevsnpvm-hostdata": "string",
-          "x-ms-sevsnpvm-idkeydigest": "string",
-          "x-ms-sevsnpvm-imageId": "string",
-          "x-ms-sevsnpvm-is-debuggable": "boolean",
-          "x-ms-sevsnpvm-launchmeasurement": "string",
-          "x-ms-sevsnpvm-microcode-svn": "number",
-          "x-ms-sevsnpvm-migration-allowed": "boolean",
-          "x-ms-sevsnpvm-reportdata": "string",
-          "x-ms-sevsnpvm-reportid": "string",
-          "x-ms-sevsnpvm-smt-allowed": "boolean",
-          "x-ms-sevsnpvm-snpfw-svn": "number",
-          "x-ms-sevsnpvm-tee-svn": "number",
-          "x-ms-sevsnpvm-vmpl": "number",
-          "x-ms-ver": "string",
+          iss: "string", // https://confidentialcomputing.googleapis.com
         };
         // Function to add key release policy claims
         const add = (type, claims) => {

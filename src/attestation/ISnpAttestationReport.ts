@@ -32,4 +32,10 @@ export interface IAttestationReport {
   "uvm_endorsements-did"?: string;
   "uvm_endorsements-feed"?: string;
   "uvm_endorsements-svn"?: string;
+  // GCP Confidential Space JWT-derived claims (e.g. "swname", "hwmodel",
+  // "image_digest") flow through the same key-release-policy validation, so
+  // allow arbitrary claim keys in addition to the Azure SNP claims above.
+  // Typed as `any` to match the existing dynamic claim indexing in
+  // KeyReleasePolicy.validateKeyReleasePolicy*.
+  [key: string]: any;
 }

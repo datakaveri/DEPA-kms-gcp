@@ -1,0 +1,13 @@
+{
+  "actions": [
+    {
+      "name": "set_gcp_key_release_policy",
+      "args": {
+        "type": "add",
+        "claims": {
+          "iss": "https://confidentialcomputing.googleapis.com"
+        }
+      }
+    }
+  ]
+}
