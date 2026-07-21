@@ -4,5 +4,5 @@ pycryptodome==3.22.0
 cose==0.9.dev8
 pre-commit==3.3.3
 detect-secrets==1.4.0
-pyjwt==2.9.0
+pyjwt==2.13.0
 cryptography==43.0.1
