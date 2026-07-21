@@ -1,0 +1,93 @@
+name: Refresh keys
+
+permissions:
+  id-token: write
+  contents: read
+
+on:
+  schedule:
+    # Run every Sunday at 02:00 IST (20:30 Saturday UTC)
+    - cron: '30 20 * * 6'
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        description: "Target environment (UAT or Production)"
+        options:
+          - UAT
+          - Production
+        default: Production
+      deployment_name:
+        type: string
+        description: "Name of the deployment"
+        default: "depa-inferencing-kms-prod-cin"
+      kms_url:
+        type: string
+        description: "KMS URL"
+        default: "https://depa-inferencing-kms-azure.ispirt.in"
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        description: "Target environment (UAT or Production)"
+        default: Production
+      deployment_name:
+        type: string
+        description: "Name of the deployment"
+        default: "depa-inferencing-kms-prod-cin"
+      kms_url:
+        type: string
+        description: "KMS URL"
+        default: "https://depa-inferencing-kms-azure.ispirt.in"
+
+jobs:
+  deploy:
+    name: ${{ inputs.deployment_name || 'depa-inferencing-kms-prod-cin' }}
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    environment: ${{ inputs.environment || 'Production' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: pip install -r requirements.txt
+
+      - name: Log into Azure
+        uses: azure/login@v2
+        with:
+          # Use a managed identity to authenticate to Azure
+          # Use properties such as client-id, tenant-id, and subscription-id in the secrets and vars
+          # The managed identity should have a federated credential with subject identiier repo:<organization>/<repo>:pull_request
+          # Use subject identifier repo:<organization>/<repo>:ref:refs/heads/<branch> for running manual CI's
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get service certificate
+        env:
+          DEPLOYMENT_NAME: ${{ inputs.deployment_name || 'depa-inferencing-kms-prod-cin' }}
+        run: |
+          curl https://identity.confidential-ledger.core.azure.com/ledgerIdentity/$DEPLOYMENT_NAME \
+          | jq -r '.ledgerTlsCertificate' > ${GITHUB_WORKSPACE}/service_cert.pem
+
+      - name: Call refresh
+        env:
+          DEPLOYMENT_NAME: ${{ inputs.deployment_name || 'depa-inferencing-kms-prod-cin' }}
+          KMS_URL: ${{ inputs.kms_url || 'https://depa-inferencing-kms-azure.ispirt.in' }}
+        run: |
+          export KMS_SERVICE_CERT_PATH=${GITHUB_WORKSPACE}/service_cert.pem
+
+          # List public keys for refresh
+          curl ${KMS_URL}/app/listpubkeys --cacert ${KMS_SERVICE_CERT_PATH} \
+            -H "Content-Type: application/json" -w '\n' | jq
+
+          export TOKEN=$(az account get-access-token --resource https://confidential-ledger.azure.com | jq -r '.accessToken')
+          curl -X POST ${KMS_URL}/app/refresh --cacert ${KMS_SERVICE_CERT_PATH} \
+            -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -w '\n' | jq
+
+          # List public keys after refresh
+          curl ${KMS_URL}/app/listpubkeys --cacert ${KMS_SERVICE_CERT_PATH} \
+            -H "Content-Type: application/json" -w '\n' | jq

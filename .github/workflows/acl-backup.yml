@@ -1,0 +1,121 @@
+name: Backup ledger
+
+permissions:
+  id-token: write
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        description: "Target environment (UAT or Production)"
+        options:
+          - UAT
+          - Production
+        default: Production
+      deployment_name:
+        type: string
+        description: "Name of the deployment"
+        default: "depa-inferencing-kms-prod-cin"
+      kms_url:
+        type: string
+        description: "KMS URL"
+        default: "https://depa-inferencing-kms-azure.ispirt.in"
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        description: "Target environment (UAT or Production)"
+        default: Production
+      deployment_name:
+        type: string
+        description: "Name of the deployment"
+        default: "depa-inferencing-kms-prod-cin"
+      kms_url:
+        type: string
+        description: "KMS URL"
+        default: "https://depa-inferencing-kms-azure.ispirt.in"
+jobs:
+  deploy:
+    name: ${{ inputs.deployment_name || 'depa-inferencing-kms-prod-cin' }}
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: pip install -r requirements.txt
+
+      - name: Log into Azure
+        uses: azure/login@v2
+        with:
+          # Use a managed identity to authenticate to Azure
+          # Use properties such as client-id, tenant-id, and subscription-id in the secrets and vars
+          # The managed identity should have a federated credential with subject identiier repo:<organization>/<repo>:pull_request
+          # Use subject identifier repo:<organization>/<repo>:ref:refs/heads/<branch> for running manual CI's
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Backup ledger
+        env:
+          DEPLOYMENT_NAME: ${{ inputs.deployment_name || 'depa-inferencing-kms-prod-cin' }}
+          SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          RESOURCE_GROUP: ${{ secrets.AZURE_RESOURCE_GROUP }}
+          STORAGE_ACCOUNT: ${{ secrets.AZURE_KMS_BACKUP_STORAGE_ACCOUNT }}
+          FILESHARE_NAME: ${{ secrets.AZURE_KMS_BACKUP_FILESHARE }}
+          RESTORE_REGION: ${{ secrets.AZURE_KMS_BACKUP_REGION }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${STORAGE_ACCOUNT:-}" ]; then
+            echo "STORAGE_ACCOUNT secret (AZURE_KMS_BACKUP_STORAGE_ACCOUNT) is required" >&2
+            exit 1
+          fi
+
+          if [ -z "${FILESHARE_NAME:-}" ]; then
+            echo "FILESHARE_NAME secret (AZURE_KMS_BACKUP_FILESHARE) is required" >&2
+            exit 1
+          fi
+
+          # Generate SAS token for the fileshare (valid for 1 day)
+          # Permissions: rwdl (read, write, delete, list)
+          EXPIRY=$(date -u -d "+1 day" +"%Y-%m-%dT%H:%MZ")
+          SAS_TOKEN=$(az storage share generate-sas \
+            --account-name "$STORAGE_ACCOUNT" \
+            --name "$FILESHARE_NAME" \
+            --permissions rwdl \
+            --expiry "$EXPIRY" \
+            --https-only \
+            --output tsv)
+
+          # Construct the full SAS URI
+          BACKUP_SAS_URI="https://${STORAGE_ACCOUNT}.file.core.windows.net/${FILESHARE_NAME}?${SAS_TOKEN}"
+          echo "Generated SAS URI for backup"
+
+          MANAGEMENT_TOKEN=$(az account get-access-token --resource https://management.azure.com | jq -r '.accessToken')
+
+          API_VERSION="2024-09-19-preview"
+          URL="https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.ConfidentialLedger/ledgers/${DEPLOYMENT_NAME}/backup?api-version=${API_VERSION}"
+
+          # Build request body per docs: https://learn.microsoft.com/en-us/rest/api/resource-manager/confidentialledger/ledger/backup?view=rest-resource-manager-confidentialledger-2024-09-19-preview&tabs=HTTP
+          BODY=$(jq -n --arg uri "$BACKUP_SAS_URI" --arg rr "$RESTORE_REGION" '{uri: $uri, restoreRegion: $rr}')
+
+          echo "Calling backup for ledger '${DEPLOYMENT_NAME}' in resource group '${RESOURCE_GROUP}'"
+          HTTP_CODE=$(curl -sS -o response.json -w "%{http_code}" -X POST "$URL" \
+            -H "Authorization: Bearer $MANAGEMENT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "$BODY")
+
+          echo "HTTP $HTTP_CODE"
+          cat response.json || true
+
+          if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "202" ]; then
+            echo "Backup request failed" >&2
+            exit 1
+          fi

@@ -1,0 +1,196 @@
+name: Update key release policy claims
+
+permissions:
+  id-token: write
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        description: "Target environment (UAT or Production)"
+        options:
+          - UAT
+          - Production
+        default: Production
+      deployment_name:
+        type: string
+        description: "Name of the deployment"
+        default: "depa-inferencing-kms-prod-cin"
+      kms_url:
+        type: string
+        description: "KMS URL"
+        default: "https://depa-inferencing-kms-azure.ispirt.in"
+      operation:
+        type: choice
+        description: "Whether to add or remove the specified claims"
+        options:
+          - add
+          - remove
+        default: add
+      service:
+        type: string
+        description: "Service name in the key release policy"
+        default: "depa-inferencing"
+      claims_json:
+        type: string
+        description: >
+          JSON object of claims to add or remove.
+          Example: {"x-ms-ver": ["2","3"], "x-ms-sevsnpvm-is-debuggable": false}
+        required: true
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        description: "Target environment (UAT or Production)"
+        default: Production
+      deployment_name:
+        type: string
+        description: "Name of the deployment"
+        default: "depa-inferencing-kms-prod-cin"
+      kms_url:
+        type: string
+        description: "KMS URL"
+        default: "https://depa-inferencing-kms-azure.ispirt.in"
+      operation:
+        type: string
+        description: "Whether to add or remove the specified claims (add or remove)"
+        default: add
+      service:
+        type: string
+        description: "Service name in the key release policy"
+        default: "depa-inferencing"
+      claims_json:
+        type: string
+        description: >
+          JSON object of claims to add or remove.
+          Example: {"x-ms-ver": ["2","3"], "x-ms-sevsnpvm-is-debuggable": false}
+        required: true
+
+jobs:
+  update-key-release-policy:
+    name: ${{ inputs.deployment_name }}
+    runs-on: self-hosted
+    continue-on-error: false
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Python 3.12
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3.12 python3.12-venv
+
+      - name: Setup Python virtual environment
+        run: |
+          python3 -m venv ccf_env
+          source ccf_env/bin/activate
+          pip install --upgrade pip
+          pip install ccf==6.0.10
+          echo "ccf_env/bin" >> $GITHUB_PATH
+
+      - name: Install Dependencies
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: pip3 install -r requirements.txt
+
+      - name: Install Azure CLI
+        run: |
+          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+      - name: Log into Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup environment variables
+        env:
+          DEPLOYMENT_NAME: ${{ inputs.deployment_name }}
+        run: |
+          export KMS_WORKSPACE=~/$DEPLOYMENT_NAME.aclworkspace
+          mkdir -p $KMS_WORKSPACE/proposals
+          echo "KMS_WORKSPACE=$KMS_WORKSPACE" >> $GITHUB_ENV
+          echo "KMS_SERVICE_CERT_PATH=${GITHUB_WORKSPACE}/service_cert.pem" >> $GITHUB_ENV
+          echo "KMS_MEMBER_CERT_PATH=$KMS_WORKSPACE/member_cert.pem" >> $GITHUB_ENV
+
+      - name: Get service certificate
+        env:
+          DEPLOYMENT_NAME: ${{ inputs.deployment_name }}
+        run: |
+          curl https://identity.confidential-ledger.core.azure.com/ledgerIdentity/$DEPLOYMENT_NAME \
+          | jq -r '.ledgerTlsCertificate' > ${KMS_SERVICE_CERT_PATH}
+
+      - name: Download member certificate from Key Vault
+        env:
+          DEPLOYMENT_NAME: ${{ inputs.deployment_name }}
+          AKV_VAULT_NAME: ${{ secrets.AZURE_KEY_VAULT_NAME }}
+        run: |
+          az keyvault certificate download \
+            --file ${KMS_MEMBER_CERT_PATH} \
+            --vault-name $AKV_VAULT_NAME \
+            --name ${DEPLOYMENT_NAME}-member-cert
+
+      - name: Validate claims JSON
+        env:
+          CLAIMS_JSON: ${{ inputs.claims_json }}
+        run: |
+          echo "$CLAIMS_JSON" | jq . > /dev/null || \
+            (echo "ERROR: claims_json is not valid JSON" && exit 1)
+
+      - name: Build key release policy proposal
+        env:
+          OPERATION: ${{ inputs.operation }}
+          SERVICE: ${{ inputs.service }}
+          CLAIMS_JSON: ${{ inputs.claims_json }}
+        run: |
+          # Save to a repo-relative path: release_policy_set.sh resolves the
+          # proposal as $REPO_ROOT/$RELEASE_POLICY_PROPOSAL, so this must be
+          # relative to the repository root.
+          PROPOSAL_PATH="${GITHUB_WORKSPACE}/governance/proposals/key_release_policy_update.json"
+          jq -n \
+            --arg service "$SERVICE" \
+            --arg type "$OPERATION" \
+            --argjson claims "$CLAIMS_JSON" \
+            '{
+              actions: [{
+                name: "set_key_release_policy",
+                args: {
+                  service: $service,
+                  type: $type,
+                  claims: $claims
+                }
+              }]
+            }' > ${PROPOSAL_PATH}
+
+          echo "Generated proposal:"
+          cat ${PROPOSAL_PATH} | jq .
+
+      - name: Apply key release policy update
+        env:
+          KMS_URL: ${{ inputs.kms_url }}
+          KMS_WORKSPACE: ${{ env.KMS_WORKSPACE }}
+          KMS_SERVICE_CERT_PATH: ${{ env.KMS_SERVICE_CERT_PATH }}
+          KMS_MEMBER_CERT_PATH: ${{ env.KMS_MEMBER_CERT_PATH }}
+          USE_AKV: "true"
+          AKV_VAULT_NAME: ${{ secrets.AZURE_KEY_VAULT_NAME }}
+          AKV_KEY_NAME: ${{ inputs.deployment_name }}-member-cert
+        run: |
+          make release-policy-set \
+            release-policy-proposal=governance/proposals/key_release_policy_update.json
+
+      - name: Verify updated key release policy
+        env:
+          KMS_URL: ${{ inputs.kms_url }}
+        run: |
+          export TOKEN=$(az account get-access-token \
+            --resource https://confidential-ledger.azure.com | jq -r '.accessToken')
+          echo "Current key release policy:"
+          curl ${KMS_URL}/app/keyReleasePolicy \
+            --cacert ${KMS_SERVICE_CERT_PATH} \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -w '\n' | jq

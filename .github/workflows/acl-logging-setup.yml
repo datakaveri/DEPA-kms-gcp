@@ -1,0 +1,112 @@
+name: Setup ACL Logging to Log Analytics
+
+permissions:
+  id-token: write
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        description: "Target environment (UAT or Production)"
+        options:
+          - UAT
+          - Production
+        default: Production
+      ledger_name:
+        type: string
+        description: "Confidential Ledger name"
+        required: true
+
+jobs:
+  setup-logging:
+    name: Setup ACL Logging
+    runs-on: self-hosted
+    continue-on-error: false
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Azure CLI
+        run: |
+          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+      - name: Log into Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install PowerShell
+        run: |
+          # Install PowerShell
+          curl -L -o /tmp/powershell.tar.gz https://github.com/PowerShell/PowerShell/releases/download/v7.4.2/powershell-7.4.2-linux-x64.tar.gz
+          sudo mkdir -p /opt/microsoft/powershell/7
+          sudo tar zxf /tmp/powershell.tar.gz -C /opt/microsoft/powershell/7
+          sudo chmod +x /opt/microsoft/powershell/7/pwsh
+          sudo ln -s /opt/microsoft/powershell/7/pwsh /usr/bin/pwsh
+          pwsh --version
+
+      - name: Install Az PowerShell Module
+        run: |
+          pwsh -Command "Install-Module -Name Az -Scope CurrentUser -Force -AllowClobber"
+
+      - name: Setup Logging Configuration
+        env:
+          SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          RESOURCE_GROUP: ${{ secrets.AZURE_LOG_ANALYTICS_RESOURCE_GROUP }}
+          LEDGER_NAME: ${{ inputs.ledger_name }}
+          LOG_ANALYTICS_WORKSPACE_NAME: ${{ secrets.AZURE_LOG_ANALYTICS_WORKSPACE_NAME }}
+        run: |
+          pwsh -Command "
+            # Set error action preference
+            `$ErrorActionPreference = 'Stop'
+            
+            # Construct ledger resource ID
+            `$ledger = \"/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.ConfidentialLedger/Ledgers/$LEDGER_NAME\"
+            
+            Write-Host \"🔍 Retrieving diagnostic setting categories for ledger: `$ledger\"
+            
+            # Retrieve the category of logs available
+            `$categories = Get-AzDiagnosticSettingCategory -ResourceId `$ledger
+            Write-Host \"Available categories:\"
+            `$categories | Format-Table -AutoSize
+            
+            # Set up transaction logs
+            Write-Host \"📝 Setting up transaction logs...\"
+            `$logtxn = New-AzDiagnosticSettingLogSettingsObject -Enabled `$true -Category transactionlogs
+            
+            # Set up user-defined logs
+            Write-Host \"📝 Setting up user-defined logs...\"
+            `$logudf = New-AzDiagnosticSettingLogSettingsObject -Enabled `$true -Category userdefinedlogs
+            
+            # Set up logs directly with Log Analytics (if provided)
+            if ('$LOG_ANALYTICS_WORKSPACE_NAME' -ne '') {
+              Write-Host \"📊 Configuring logs with Log Analytics Workspace: $LOG_ANALYTICS_WORKSPACE_NAME\"
+              `$workspaceId = \"/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.operationalinsights/workspaces/$LOG_ANALYTICS_WORKSPACE_NAME\"
+              
+              try {
+                New-AzDiagnosticSetting -ResourceId `$ledger -Name TXN_LOGS_LA -WorkspaceId `$workspaceId -Log `$logtxn -ErrorAction Stop
+                Write-Host \"✅ Successfully configured transaction logs with Log Analytics Workspace\"
+              } catch {
+                Write-Host \"⚠️  Warning: Failed to configure Log Analytics logging: `$_\" -ForegroundColor Yellow
+              }
+            } else {
+              Write-Host \"⏭️  Skipping Log Analytics configuration (not provided)\"
+            }
+            
+            # Check existing configurations
+            Write-Host \"🔍 Checking existing diagnostic settings...\"
+            `$existingSettings = Get-AzDiagnosticSetting -ResourceId `$ledger
+            if (`$existingSettings) {
+              Write-Host \"Current diagnostic settings:\"
+              `$existingSettings | Format-List
+            } else {
+              Write-Host \"No diagnostic settings found.\"
+            }
+            
+            Write-Host \"✅ Logging configuration completed!\"
+          "
