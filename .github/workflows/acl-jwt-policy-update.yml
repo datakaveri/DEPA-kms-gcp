@@ -29,6 +29,7 @@ on:
           - managed-identity
           - aad
           - token
+          - gcp-workload
         default: "managed-identity"
       managed_identity_resource_id:
         type: string
@@ -36,8 +37,15 @@ on:
         required: false
       jwt_token:
         type: string
-        description: "JWT token to extract trust policy from. Required when trust_type is 'token'"
+        description: "JWT token to extract trust policy from. Required when trust_type is 'token'. For 'gcp-workload', a SAMPLE Confidential Space token whose signature is verified before its service account is allowlisted."
         required: false
+      operation:
+        type: choice
+        description: "For trust_type 'gcp-workload': add or remove the workload's service account from the GCP key release allowlist"
+        options:
+          - add
+          - remove
+        default: add
   workflow_call:
     inputs:
       environment:
@@ -54,7 +62,7 @@ on:
         default: "https://depa-inferencing-kms-azure.ispirt.in"
       trust_type:
         type: string
-        description: "Type of JWT trust to configure (managed-identity, aad, or token)"
+        description: "Type of JWT trust to configure (managed-identity, aad, token, or gcp-workload)"
         default: "managed-identity"
       managed_identity_resource_id:
         type: string
@@ -62,8 +70,12 @@ on:
         required: false
       jwt_token:
         type: string
-        description: "JWT token to extract trust policy from. Required when trust_type is 'token'"
+        description: "JWT token to extract trust policy from. Required when trust_type is 'token' or 'gcp-workload'"
         required: false
+      operation:
+        type: string
+        description: "For trust_type 'gcp-workload': add or remove the service account (add or remove)"
+        default: add
 
 jobs:
   update-jwt-policy:
@@ -165,8 +177,17 @@ jobs:
             echo "Error: jwt_token is required when trust_type is 'token'"
             exit 1
           fi
+          if [ "$TRUST_TYPE" = "gcp-workload" ] && [ -z "$JWT_TOKEN" ]; then
+            echo "Error: jwt_token (a sample Confidential Space token) is required when trust_type is 'gcp-workload'"
+            exit 1
+          fi
 
+      # ---------------------------------------------------------------------
+      # Azure trust types (managed-identity / aad / token) configure the JWT
+      # VALIDATION policy (authentication / Gate 1) via jwt-issuer-trust.
+      # ---------------------------------------------------------------------
       - name: Update JWT validation policy
+        if: ${{ inputs.trust_type != 'gcp-workload' }}
         env:
           DEPLOYMENT_NAME: ${{ inputs.deployment_name || 'depa-inferencing-kms-prod-cin' }}
           KMS_URL: ${{ env.KMS_URL }}
@@ -196,6 +217,7 @@ jobs:
           make jwt-issuer-trust
 
       - name: Print updated JWT validation policy
+        if: ${{ inputs.trust_type != 'gcp-workload' }}
         env:
           KMS_URL: ${{ env.KMS_URL }}
           KMS_SERVICE_CERT_PATH: ${{ env.KMS_SERVICE_CERT_PATH }}
@@ -204,5 +226,84 @@ jobs:
           echo ""
           curl ${KMS_URL}/app/jwtValidationPolicy \
             --cacert ${KMS_SERVICE_CERT_PATH} \
+            -H "Content-Type: application/json" \
+            -w '\n' | jq .
+
+      # ---------------------------------------------------------------------
+      # GCP workload registration. NOTE: unlike the Azure trust types above,
+      # this path writes the GCP KEY RELEASE policy (authorization / Gate 2),
+      # not the JWT validation policy. It verifies the sample Confidential Space
+      # token was genuinely signed by Google, extracts google_service_accounts,
+      # and submits a member-signed set_gcp_key_release_policy proposal. The
+      # member signature is the trust anchor; the JWT signature check is
+      # operator-side assurance that a real workload ran as that service account.
+      # ---------------------------------------------------------------------
+      - name: Verify sample JWT and extract service accounts
+        if: ${{ inputs.trust_type == 'gcp-workload' }}
+        env:
+          JWT_TOKEN: ${{ inputs.jwt_token }}
+        run: |
+          # Keep the raw token out of the logs.
+          echo "::add-mask::$JWT_TOKEN"
+          # Verifies Google's signature + issuer + swname, then prints the
+          # google_service_accounts as a JSON array. Fails the job if the token
+          # is forged, not a Confidential Space token, or carries no service
+          # account - so nothing gets proposed in that case.
+          SERVICE_ACCOUNTS=$(python scripts/kms/gcp_extract_workload_sa.py "$JWT_TOKEN")
+          echo "Verified service account(s): $SERVICE_ACCOUNTS"
+          echo "SERVICE_ACCOUNTS=$SERVICE_ACCOUNTS" >> $GITHUB_ENV
+
+      - name: Build and apply GCP key release policy proposal
+        if: ${{ inputs.trust_type == 'gcp-workload' }}
+        env:
+          OPERATION: ${{ inputs.operation || 'add' }}
+          SERVICE_ACCOUNTS: ${{ env.SERVICE_ACCOUNTS }}
+          KMS_URL: ${{ env.KMS_URL }}
+          KMS_WORKSPACE: ${{ env.KMS_WORKSPACE }}
+          KMS_SERVICE_CERT_PATH: ${{ env.KMS_SERVICE_CERT_PATH }}
+          KMS_MEMBER_CERT_PATH: ${{ env.KMS_MEMBER_CERT_PATH }}
+          USE_AKV: "true"
+          AKV_VAULT_NAME: ${{ secrets.AZURE_KEY_VAULT_NAME }}
+          AKV_KEY_NAME: ${{ inputs.deployment_name }}-member-cert
+        run: |
+          # release_policy_set.sh resolves the proposal as
+          # $REPO_ROOT/$RELEASE_POLICY_PROPOSAL, so keep it repo-relative.
+          # The set_gcp_key_release_policy action dedupes on add and errors on
+          # removing an absent value, so no client-side diff is needed here.
+          PROPOSAL_PATH="${GITHUB_WORKSPACE}/governance/proposals/gcp_key_release_policy_update.json"
+          jq -n \
+            --arg type "$OPERATION" \
+            --argjson sas "$SERVICE_ACCOUNTS" \
+            '{
+              actions: [{
+                name: "set_gcp_key_release_policy",
+                args: {
+                  type: $type,
+                  claims: { "google_service_accounts": $sas }
+                }
+              }]
+            }' > ${PROPOSAL_PATH}
+
+          echo "Generated proposal:"
+          cat ${PROPOSAL_PATH} | jq .
+
+          # release_policy_set.sh is generic: it signs and submits whatever
+          # proposal file it is handed (here a set_gcp_key_release_policy action).
+          make release-policy-set \
+            release-policy-proposal=governance/proposals/gcp_key_release_policy_update.json
+
+      - name: Print updated GCP key release policy
+        if: ${{ inputs.trust_type == 'gcp-workload' }}
+        env:
+          KMS_URL: ${{ env.KMS_URL }}
+          KMS_SERVICE_CERT_PATH: ${{ env.KMS_SERVICE_CERT_PATH }}
+        run: |
+          echo "=== Updated GCP Key Release Policy ==="
+          echo ""
+          export TOKEN=$(az account get-access-token \
+            --resource https://confidential-ledger.azure.com | jq -r '.accessToken')
+          curl "${KMS_URL}/app/keyReleasePolicy?attestationType=gcp" \
+            --cacert ${KMS_SERVICE_CERT_PATH} \
+            -H "Authorization: Bearer $TOKEN" \
             -H "Content-Type: application/json" \
             -w '\n' | jq .

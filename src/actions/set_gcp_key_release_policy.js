@@ -19,6 +19,12 @@ export let action = [
         // key-release policy is expressed over the Confidential Space JWT.
         const CLAIMS = {
           iss: "string", // https://confidentialcomputing.googleapis.com
+          // GCP IAM service account(s) the Confidential Space workload runs as.
+          // This is the trusted-workload allowlist populated at registration
+          // time (analogous to Azure "x-ms-sevsnpvm-hostdata").
+          google_service_accounts: "string",
+          // TODO: image_digest ("sha256:...") to be added here later to pin a
+          // fixed set of trusted container images; for now any image is allowed.
         };
         // Function to add key release policy claims
         const add = (type, claims) => {

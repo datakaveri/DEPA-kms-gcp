@@ -34,6 +34,13 @@ const extractGcpClaims = (payload: {
     // Policy comparison is string/number based; collapse arrays to a scalar.
     claims[key] = Array.isArray(value) ? value.join(",") : value;
   };
+  // Membership-style claims are kept as arrays so the key release policy can
+  // check "any value in the token is in the allowlist" (see
+  // KeyReleasePolicy.validateKeyReleasePolicyClaims). Do NOT collapse these.
+  const setRaw = (key: string, value: any) => {
+    if (value === undefined || value === null) return;
+    claims[key] = value;
+  };
 
   // Top-level Confidential Space token claims.
   set("iss", payload.iss);
@@ -46,6 +53,12 @@ const extractGcpClaims = (payload: {
   set("oemid", payload.oemid);
   set("dbgstat", payload.dbgstat); // e.g. "disabled-since-boot"
   set("secboot", payload.secboot);
+
+  // GCP IAM service account(s) the Confidential Space VM runs as. This is the
+  // identity the key release policy allowlists (analogous to Azure hostdata).
+  // Kept as the raw array: a token may carry more than one, and the policy
+  // passes if ANY of them is in the trusted allowlist.
+  setRaw("google_service_accounts", payload.google_service_accounts);
 
   // Workload container claims (submods.container).
   const container = payload.submods?.container;

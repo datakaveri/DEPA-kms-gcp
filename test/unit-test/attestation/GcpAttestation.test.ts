@@ -280,25 +280,100 @@ describe("GCP key release policy validation (via KeyReleasePolicy)", () => {
 });
 
 // ==========================================================================
-describe("validateGcpAttestation with real SNP verification", () => {
-  test("fails when attestation binary is invalid (dummy data)", () => {
-    setGcpClaims({ "x-ms-sevsnpvm-launchmeasurement": GCP_VALID_MEASUREMENTS });
-    // The CCF polyfill rejects non-SNP binary; this confirms the real
-    // verification path is active (not a hardcoded stub).
-    const result = validateGcpAttestation(DUMMY_ATTESTATION);
+// GCP Confidential Space is authorized on the OIDC JWT claims (not a raw SNP
+// report). These exercise the google_service_accounts allowlist end to end
+// through validateGcpAttestation.
+// ==========================================================================
+const GCP_ISS = "https://confidentialcomputing.googleapis.com";
+const jwtClaims = (overrides: { [k: string]: any } = {}) => ({
+  iss: GCP_ISS,
+  swname: "CONFIDENTIAL_SPACE",
+  ...overrides,
+});
+
+describe("validateGcpAttestation (Confidential Space JWT claims)", () => {
+  test("fails when JWT claims are missing", () => {
+    const result = validateGcpAttestation(undefined);
     expect(result.success).toBe(false);
+    expect(result.statusCode).toBe(400);
+    expect(result.error?.errorMessage).toContain(
+      "missing GCP Confidential Space JWT claims",
+    );
+  });
+
+  test("passes when the workload service account is in the allowlist", () => {
+    setGcpClaims({
+      google_service_accounts: [
+        "gpu-cs-sa@p3dx-depa-sandbox.iam.gserviceaccount.com",
+      ],
+    });
+    const result = validateGcpAttestation(
+      jwtClaims({
+        google_service_accounts: [
+          "gpu-cs-sa@p3dx-depa-sandbox.iam.gserviceaccount.com",
+        ],
+      }),
+    );
+    expect(result.success).toBe(true);
+  });
+
+  test("fails when the workload service account is not in the allowlist", () => {
+    setGcpClaims({
+      google_service_accounts: ["trusted-sa@proj.iam.gserviceaccount.com"],
+    });
+    const result = validateGcpAttestation(
+      jwtClaims({
+        google_service_accounts: ["evil-sa@other.iam.gserviceaccount.com"],
+      }),
+    );
+    expect(result.success).toBe(false);
+    expect(result.statusCode).toBe(400);
+  });
+
+  test("passes when any one of multiple workload SAs is allowlisted", () => {
+    setGcpClaims({
+      google_service_accounts: ["trusted-sa@proj.iam.gserviceaccount.com"],
+    });
+    const result = validateGcpAttestation(
+      jwtClaims({
+        google_service_accounts: [
+          "other-sa@x.iam.gserviceaccount.com",
+          "trusted-sa@proj.iam.gserviceaccount.com",
+        ],
+      }),
+    );
+    expect(result.success).toBe(true);
+  });
+
+  test("fails when the token carries no service account at all", () => {
+    setGcpClaims({
+      google_service_accounts: ["trusted-sa@proj.iam.gserviceaccount.com"],
+    });
+    // policy requires google_service_accounts but the token has none
+    const result = validateGcpAttestation(jwtClaims());
+    expect(result.success).toBe(false);
+    expect(result.statusCode).toBe(400);
   });
 });
 
 // ==========================================================================
 describe("validateAttestation routing", () => {
-  test("routes to GCP path when attestationType is 'gcp' (error is GCP-specific)", () => {
-    setGcpClaims({ "x-ms-sevsnpvm-launchmeasurement": GCP_VALID_MEASUREMENTS });
-
-    const result = validateAttestation(DUMMY_ATTESTATION, "gcp");
-    expect(result.success).toBe(false);
-    // GCP-specific error message confirms the GCP code path was taken.
-    expect(result.error?.errorMessage).toContain("GCP attestation error");
+  test("routes to GCP path when attestationType is 'gcp'", () => {
+    setGcpClaims({
+      google_service_accounts: [
+        "gpu-cs-sa@p3dx-depa-sandbox.iam.gserviceaccount.com",
+      ],
+    });
+    // Passing GCP JWT claims (3rd arg) with a matching SA succeeds only on the
+    // GCP path; the Azure path would attempt SNP binary verification and fail.
+    const result = validateAttestation(undefined, "gcp", {
+      iss: "https://confidentialcomputing.googleapis.com",
+      swname: "CONFIDENTIAL_SPACE",
+      google_service_accounts: [
+        "gpu-cs-sa@p3dx-depa-sandbox.iam.gserviceaccount.com",
+      ],
+    });
+    expect(result.success).toBe(true);
   });
 
   test("defaults to azure path when attestationType is omitted", () => {
