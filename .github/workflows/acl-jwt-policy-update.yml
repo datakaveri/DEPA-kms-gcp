@@ -143,6 +143,10 @@ jobs:
           DEPLOYMENT_NAME: ${{ inputs.deployment_name || 'depa-inferencing-kms-prod-cin' }}
           KMS_URL: ${{ inputs.kms_url }}
         run: |
+          # Propagate KMS_URL to $GITHUB_ENV so downstream steps that reference
+          # ${{ env.KMS_URL }} (register/print) receive it — a step-level env var
+          # is not visible to later steps otherwise.
+          echo "KMS_URL=$KMS_URL" >> $GITHUB_ENV
           export KMS_WORKSPACE=~/$DEPLOYMENT_NAME.aclworkspace
           mkdir -p $KMS_WORKSPACE/proposals
           echo "KMS_WORKSPACE=$KMS_WORKSPACE" >> $GITHUB_ENV
