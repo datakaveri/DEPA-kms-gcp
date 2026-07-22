@@ -4,10 +4,11 @@
 import * as ccfapp from "@microsoft/ccf-app";
 import { ServiceResult } from "../utils/ServiceResult";
 import { enableEndpoint } from "../utils/Tooling";
-import { keyReleasePolicyMap } from "../repositories/Maps";
+import { keyReleasePolicyMap, gcpKeyReleasePolicyMap } from "../repositories/Maps";
 import { ServiceRequest } from "../utils/ServiceRequest";
 import { KeyReleasePolicy } from "../policies/KeyReleasePolicy";
 import { IKeyReleasePolicy } from "../policies/IKeyReleasePolicy";
+import { AttestationProvider } from "../attestation/ISnpAttestation";
 import { LogContext } from "../utils/Logger";
 
 // Enable the endpoint
@@ -15,6 +16,11 @@ enableEndpoint();
 
 /**
  * Retrieves the key release policy.
+ *
+ * Cloud is selected the same way as /key and /unwrapKey, via the
+ * `attestationType` selector (default "azure"). Since this is a GET, the
+ * selector is a query parameter: `?attestationType=gcp` returns the GCP policy
+ * (`public:policies.gcp_key_release`), otherwise the Azure policy is returned.
  * @returns A ServiceResult containing the key release policy properties.
  */
 export const keyReleasePolicy = (
@@ -27,10 +33,17 @@ export const keyReleasePolicy = (
   const [_, isValidIdentity] = serviceRequest.isAuthenticated();
   if (isValidIdentity.failure) return isValidIdentity;
 
+  const attestationProvider: AttestationProvider =
+    (serviceRequest.query?.["attestationType"] as AttestationProvider) || "azure";
+  const policyMap =
+    attestationProvider === "gcp" ? gcpKeyReleasePolicyMap : keyReleasePolicyMap;
+
   try {
-    const result =
-      KeyReleasePolicy.getKeyReleasePolicyFromMap(keyReleasePolicyMap, logContext);
-      return ServiceResult.Succeeded<IKeyReleasePolicy>(result, logContext);
+    const result = KeyReleasePolicy.getKeyReleasePolicyFromMap(
+      policyMap,
+      logContext,
+    );
+    return ServiceResult.Succeeded<IKeyReleasePolicy>(result, logContext);
   } catch (error: any) {
     return ServiceResult.Failed<string>({ errorMessage: error.message }, 500, logContext);
   }

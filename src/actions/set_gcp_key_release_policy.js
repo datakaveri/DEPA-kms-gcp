@@ -13,12 +13,17 @@ export let action = [
         checkType(args.claims, "object");
       },
       function (args) {
-        // GCP Confidential Space OIDC token claims (flattened by
-        // GcpAttestationValidation.extractGcpClaims). These replace the Azure
-        // x-ms-sevsnpvm-* claims: GCP does not expose a raw SNP report, so the
-        // key-release policy is expressed over the Confidential Space JWT.
+        // GCP Confidential Space Gate 2 (authorization) claims. This map is the
+        // GCP analog of the Azure "x-ms-sevsnpvm-hostdata" allowlist: it pins the
+        // code MEASUREMENT. The caller IDENTITY (google_service_accounts) is NOT
+        // here - it is authorized at Gate 1 (jwt_validation), like the Azure
+        // managed-identity sub/oid.
         const CLAIMS = {
-          iss: "string", // https://confidentialcomputing.googleapis.com
+          // Container image the Confidential Space workload runs, as reported in
+          // the CS token's submods.container.image_digest ("sha256:..."). This is
+          // the trusted-image allowlist. Until entries are added, GcpAttestation-
+          // Validation treats an empty policy as "any image allowed".
+          image_digest: "string",
         };
         // Function to add key release policy claims
         const add = (type, claims) => {

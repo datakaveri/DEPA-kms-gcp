@@ -57,12 +57,19 @@ export class KeyReleasePolicy implements IKeyReleasePolicy {
           logContext,
         );
       }
-      if (
-        policyValue.filter((p) => {
-          Logger.debug(`Check if policy value ${p} === ${attestationValue}`, logContext);
-          return p.toString() === attestationValue.toString();
-        }).length === 0
-      ) {
+      // The attestation value may be a scalar (Azure SNP claims, GCP scalar
+      // claims) or an array (e.g. GCP "google_service_accounts"). Normalise to
+      // an array and pass if ANY of its values is in the policy allowlist.
+      const attestationValues = Array.isArray(attestationValue)
+        ? attestationValue
+        : [attestationValue];
+      const matched = attestationValues.some((av) =>
+        policyValue.some((p) => {
+          Logger.debug(`Check if policy value ${p} === ${av}`, logContext);
+          return p.toString() === av.toString();
+        }),
+      );
+      if (!matched) {
         return ServiceResult.Failed<string>(
           {
             errorMessage: `Attestation claim ${key}, value ${attestationValue} does not match policy values: ${policyValue}`,

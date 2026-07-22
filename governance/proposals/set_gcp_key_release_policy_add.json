@@ -5,7 +5,9 @@
       "args": {
         "type": "add",
         "claims": {
-          "iss": "https://confidentialcomputing.googleapis.com"
+          "image_digest": [
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+          ]
         }
       }
     }

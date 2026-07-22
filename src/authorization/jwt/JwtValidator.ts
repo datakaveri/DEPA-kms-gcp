@@ -57,14 +57,16 @@ export class JwtValidator implements IValidatorService {
       const jwtProp = jwtCaller?.jwt?.payload[key];
       let compliant = false;
 
-      // Check if policy[key] is an array
-      if (Array.isArray(policy[key])) {
-        // Check if jwtProp is in the array
-        compliant = policy[key].includes(jwtProp);
-      } else {
-        // Perform the existing equality check
-        compliant = jwtProp === policy[key];
-      }
+      // Normalise both sides to arrays and pass if ANY token value matches ANY
+      // policy value. This makes the policy value an allowlist and, crucially,
+      // supports array-valued token claims such as `google_service_accounts`
+      // (the GCP Confidential Space service-account allowlist enforced here at
+      // Gate 1, analogous to the Azure managed-identity `sub`/`oid`). Scalar
+      // claims (iss, sub, oid, swname) keep the original strict-equality
+      // behaviour since a one-element array compares identically.
+      const policyValues = Array.isArray(policy[key]) ? policy[key] : [policy[key]];
+      const jwtValues = Array.isArray(jwtProp) ? jwtProp : [jwtProp];
+      compliant = jwtValues.some((jv) => policyValues.some((pv) => pv === jv));
 
       Logger.debug(
         `isValidJwtToken: ${key}, expected: ${policy[key]}, found: ${jwtProp}, ${compliant}`, this.logContext
