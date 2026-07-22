@@ -5,4 +5,5 @@ cose==0.9.dev8
 pre-commit==3.3.3
 detect-secrets==1.4.0
 pyjwt==2.9.0
-cryptography==43.0.1
+# cryptography is pulled in transitively by ccf (pinned to 44.*); PyJWT's RS256
+# verification uses it. Do NOT pin it here — an explicit pin conflicts with ccf.
