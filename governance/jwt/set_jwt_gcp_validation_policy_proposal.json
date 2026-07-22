@@ -6,7 +6,8 @@
         "issuer": "https://confidentialcomputing.googleapis.com",
         "validation_policy": {
           "iss": "https://confidentialcomputing.googleapis.com",
-          "swname": "CONFIDENTIAL_SPACE"
+          "swname": "CONFIDENTIAL_SPACE",
+          "google_service_accounts": []
         }
       }
     }

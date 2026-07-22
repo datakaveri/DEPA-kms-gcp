@@ -13,3 +13,7 @@ aad.env
 temp*/
 __pycache__/
 .venv
+actions-runner/
+
+# never commit private-key bundles
+*.pfx

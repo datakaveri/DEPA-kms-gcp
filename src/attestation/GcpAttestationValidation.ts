@@ -14,16 +14,22 @@ import { Logger, LogContext } from "../utils/Logger";
  * AMD SEV-SNP report (with endorsements / uvm_endorsements) to the workload.
  * The hardware-rooted attestation is delivered as the
  * `confidentialcomputing.googleapis.com` OIDC JWT. That token is already
- * cryptographically validated by the CCF `jwt` auth policy (issuer + signing
- * key registered at the governance level) before this code runs, so we
- * authorize key release on the JWT claims rather than on
- * `snp_attestation.verifySnpAttestation()`.
+ * cryptographically validated by the CCF `jwt` auth policy before this code runs.
  *
- * The relevant Confidential Space claims are flattened into the same flat
- * claim dictionary consumed by `KeyReleasePolicy.validateKeyReleasePolicy`,
- * and checked against `gcpKeyReleasePolicyMap` (populated via the
- * `set_gcp_key_release_policy` governance action with Confidential Space claim
- * keys, not `x-ms-sevsnpvm-*`).
+ * Gate split (mirrors Azure):
+ *  - Gate 1 (authentication, jwt_validation): the caller IDENTITY - the GCP IAM
+ *    `google_service_accounts` - is authorized here by `JwtValidator`, exactly
+ *    as the Azure managed-identity `sub`/`oid` is. It is NOT re-checked below.
+ *  - Gate 2 (authorization, this function): the code MEASUREMENT - the container
+ *    `image_digest` - is checked against `gcpKeyReleasePolicyMap` (the GCP analog
+ *    of the Azure `x-ms-sevsnpvm-hostdata` allowlist), populated via the
+ *    `set_gcp_key_release_policy` governance action.
+ *
+ * Image pinning is being rolled out incrementally: until an `image_digest`
+ * allowlist has been registered, the GCP key release policy is empty and Gate 2
+ * is a pass-through (any image accepted) - authorization then rests entirely on
+ * the Gate 1 service-account allowlist. Once image_digest entries exist, they
+ * are enforced.
  */
 const extractGcpClaims = (payload: {
   [key: string]: any;
@@ -35,19 +41,23 @@ const extractGcpClaims = (payload: {
     claims[key] = Array.isArray(value) ? value.join(",") : value;
   };
 
-  // Top-level Confidential Space token claims.
+  // Top-level Confidential Space token claims (environmental; the identity
+  // claim `google_service_accounts` is deliberately NOT surfaced here - it is
+  // authorized at Gate 1 by JwtValidator, not in the Gate 2 key release policy).
   set("iss", payload.iss);
   set("swname", payload.swname); // "CONFIDENTIAL_SPACE"
   set(
     "swversion",
     Array.isArray(payload.swversion) ? payload.swversion[0] : payload.swversion,
   );
-  set("hwmodel", payload.hwmodel); // e.g. "GCP_AMD_SEV"
+  set("hwmodel", payload.hwmodel); // e.g. "GCP_INTEL_TDX"
   set("oemid", payload.oemid);
   set("dbgstat", payload.dbgstat); // e.g. "disabled-since-boot"
   set("secboot", payload.secboot);
 
-  // Workload container claims (submods.container).
+  // Workload container claims (submods.container). `image_digest` is the code
+  // MEASUREMENT the Gate 2 key release policy allowlists - the GCP analog of
+  // Azure `x-ms-sevsnpvm-hostdata`.
   const container = payload.submods?.container;
   if (container) {
     set("image_digest", container.image_digest); // "sha256:..."
@@ -88,6 +98,23 @@ export const validateGcpAttestation = (
     const attestationClaims = extractGcpClaims(jwtClaims);
     Logger.debug(`GCP attestation claims: `, logContext, attestationClaims);
 
+    // Gate 2 image-digest pinning is incremental. Until an image_digest
+    // allowlist is registered the GCP key release map is empty; treat that as
+    // "any image allowed" and let authorization rest on the Gate 1
+    // service-account allowlist. Checked BEFORE getKeyReleasePolicyFromMap,
+    // which throws when the mandatory `claims` entry is absent.
+    if (gcpKeyReleasePolicyMap.size === 0) {
+      Logger.info(
+        `GCP key release policy is empty (image pinning not enabled); skipping ` +
+          `Gate 2 image check - authorization enforced at Gate 1 (service account).`,
+        logContext,
+      );
+      return ServiceResult.Succeeded<IAttestationReport>(
+        attestationClaims,
+        logContext,
+      );
+    }
+
     const keyReleasePolicy = KeyReleasePolicy.getKeyReleasePolicyFromMap(
       gcpKeyReleasePolicyMap,
       logContext,
@@ -96,6 +123,20 @@ export const validateGcpAttestation = (
       `GCP key release policy: ${JSON.stringify(keyReleasePolicy)}`,
       logContext,
     );
+
+    // A policy whose `claims` were all removed leaves an empty object; also a
+    // pass-through until image_digest entries are (re)added.
+    if (Object.keys(keyReleasePolicy.claims).length === 0) {
+      Logger.info(
+        `GCP key release policy has no claims (image pinning not enabled); ` +
+          `skipping Gate 2 image check.`,
+        logContext,
+      );
+      return ServiceResult.Succeeded<IAttestationReport>(
+        attestationClaims,
+        logContext,
+      );
+    }
 
     return KeyReleasePolicy.validateKeyReleasePolicy(
       keyReleasePolicy,
