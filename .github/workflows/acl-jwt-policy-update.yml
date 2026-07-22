@@ -80,7 +80,7 @@ on:
 jobs:
   update-jwt-policy:
     name: Update JWT Policy for ${{ inputs.deployment_name }}
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
     continue-on-error: false
     steps:
