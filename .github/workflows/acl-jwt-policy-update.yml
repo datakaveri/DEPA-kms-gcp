@@ -80,7 +80,7 @@ on:
 jobs:
   update-jwt-policy:
     name: Update JWT Policy for ${{ inputs.deployment_name }}
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     environment: ${{ inputs.environment }}
     continue-on-error: false
     steps:
@@ -111,10 +111,14 @@ jobs:
         run: pip3 install -r requirements.txt
 
       - name: Install Azure CLI
+        # Azure trust types only. gcp-workload signs locally with on-disk member
+        # certs and never touches Azure Key Vault, so it needs no Azure CLI/login.
+        if: ${{ inputs.trust_type != 'gcp-workload' }}
         run: |
           curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
 
       - name: Log into Azure
+        if: ${{ inputs.trust_type != 'gcp-workload' }}
         uses: azure/login@v2
         with:
           # Use a managed identity to authenticate to Azure
@@ -126,6 +130,7 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Install Azure CLI confidentialledger extension
+        if: ${{ inputs.trust_type != 'gcp-workload' }}
         run: |
           az version
           az extension add --name confidentialledger --yes
@@ -152,6 +157,7 @@ jobs:
           | jq -r '.ledgerTlsCertificate' > ${KMS_SERVICE_CERT_PATH}
 
       - name: Download member certificate from Key Vault
+        if: ${{ inputs.trust_type != 'gcp-workload' }}
         env:
           DEPLOYMENT_NAME: ${{ inputs.deployment_name || 'depa-inferencing-kms-prod-cin' }}
           KMS_WORKSPACE: ${{ env.KMS_WORKSPACE }}
@@ -270,10 +276,13 @@ jobs:
           KMS_URL: ${{ env.KMS_URL }}
           KMS_WORKSPACE: ${{ env.KMS_WORKSPACE }}
           KMS_SERVICE_CERT_PATH: ${{ env.KMS_SERVICE_CERT_PATH }}
-          KMS_MEMBER_CERT_PATH: ${{ env.KMS_MEMBER_CERT_PATH }}
-          USE_AKV: "true"
-          AKV_VAULT_NAME: ${{ secrets.AZURE_KEY_VAULT_NAME }}
-          AKV_KEY_NAME: ${{ inputs.deployment_name }}-member-cert
+          # Local signing on the self-hosted runner: the member cert and private
+          # key stay on the runner's disk (never uploaded anywhere). USE_AKV=false
+          # so ccf-sign uses the on-disk key directly instead of Azure Key Vault.
+          # vars.KMS_KEYS_DIR points at the local dev_common directory.
+          KMS_MEMBER_CERT_PATH: ${{ vars.KMS_KEYS_DIR }}/member0_cert.pem
+          KMS_MEMBER_PRIVK_PATH: ${{ vars.KMS_KEYS_DIR }}/member0_privk.pem
+          USE_AKV: "false"
         run: |
           set -euo pipefail
           ISSUER="https://confidentialcomputing.googleapis.com"
