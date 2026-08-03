@@ -13,6 +13,11 @@ import { gcpKeyReleaseMapName } from "../../../src/repositories/Maps";
 import { ISnpAttestation } from "../../../src/attestation/ISnpAttestation";
 import { JwtValidator } from "../../../src/authorization/jwt/JwtValidator";
 import { validationPolicyMapName } from "../../../src/authorization/jwt/JwtValidationPolicyMap";
+import {
+  canonicalContainerString,
+  CONTAINER_MEASUREMENT_VERSION,
+} from "../../../src/attestation/containerMeasurement";
+import { createHash } from "crypto";
 
 // GCP Confidential Space authorization is split across two gates, mirroring
 // Azure:
@@ -79,6 +84,26 @@ const gcpToken = (overrides: { [k: string]: any } = {}) => ({
   submods: { container: { image_digest: "sha256:aaaa" } },
   ...overrides,
 });
+
+// A CS token carrying a full container object (+ optional top-level claims such
+// as dbgstat / secboot), for the container_measurement / posture tests.
+const gcpTokenWithContainer = (
+  container: { [k: string]: any },
+  top: { [k: string]: any } = {},
+) => ({
+  iss: GCP_ISS,
+  swname: "CONFIDENTIAL_SPACE",
+  submods: { container },
+  ...top,
+});
+
+// Independent (Node-side) recomputation of the measurement — mirrors exactly
+// what the offline registration CLI does: SHA-256 over the shared canonical
+// string. If this and the KMS ever disagree, canonicalisation has drifted.
+const measurementOf = (container: { [k: string]: any }): string =>
+  createHash("sha256")
+    .update(canonicalContainerString(container), "utf8")
+    .digest("hex");
 
 beforeAll(() => {
   Logger.setLogLevel(LogLevel.ERROR); // keep test output clean
@@ -258,5 +283,144 @@ describe("validateAttestation routing", () => {
     const result = validateAttestation(DUMMY_ATTESTATION, "azure");
     expect(result.success).toBe(false);
     expect(result.error?.errorMessage).not.toContain("GCP");
+  });
+});
+
+// ==========================================================================
+// container_measurement canonicalisation - GOLDEN values. These lock the exact
+// bytes that get hashed so the KMS (Gate 2) and the offline registration CLI can
+// never silently diverge. If you intentionally change the format, bump
+// CONTAINER_MEASUREMENT_VERSION and update these expected values.
+// ==========================================================================
+describe("container measurement: canonical string + golden hash", () => {
+  const SAMPLE = {
+    image_digest: "sha256:aaaa",
+    image_id: "sha256:bbbb",
+    restart_policy: "Never",
+    args: ["sh", "/server/bin/init_server_basic"],
+  };
+
+  test("canonical string is the exact fixed-format v1 layout", () => {
+    expect(canonicalContainerString(SAMPLE)).toBe(
+      [
+        "depa-gcp-container-measurement/v1",
+        "image_digest=sha256:aaaa",
+        "image_id=sha256:bbbb",
+        "restart_policy=Never",
+        'args=["sh","/server/bin/init_server_basic"]',
+      ].join("\n"),
+    );
+    expect(canonicalContainerString(SAMPLE).startsWith(
+      CONTAINER_MEASUREMENT_VERSION,
+    )).toBe(true);
+  });
+
+  test("SHA-256 of the canonical string matches the golden hash", () => {
+    expect(measurementOf(SAMPLE)).toBe(
+      "e6a1ee6787055ddd7aba43c23d6a9daffd540e0031d27900930ce116f60b2cdd",
+    );
+  });
+
+  test("field order in the object does not change the measurement", () => {
+    const reordered = {
+      args: ["sh", "/server/bin/init_server_basic"],
+      restart_policy: "Never",
+      image_id: "sha256:bbbb",
+      image_digest: "sha256:aaaa",
+    };
+    expect(measurementOf(reordered)).toBe(measurementOf(SAMPLE));
+  });
+
+  test("a change to any hashed field changes the measurement", () => {
+    expect(measurementOf({ ...SAMPLE, args: ["sh", "-x"] })).not.toBe(
+      measurementOf(SAMPLE),
+    );
+    expect(measurementOf({ ...SAMPLE, image_digest: "sha256:zzzz" })).not.toBe(
+      measurementOf(SAMPLE),
+    );
+  });
+});
+
+// ==========================================================================
+// Gate 2 - authorization via container_measurement (the hostdata analog) and
+// the launcher/hardware posture claims (dbgstat / secboot). The KMS recomputes
+// the measurement from the token and matches it against the registered
+// allowlist, exactly as it would for Azure x-ms-sevsnpvm-hostdata.
+// ==========================================================================
+describe("Gate 2: validateGcpAttestation container_measurement + posture", () => {
+  const CONTAINER = {
+    image_digest:
+      "sha256:7a26b814c5dad71ae0e4ab08855039394d4429e0a947757c92c8953cc5bacc2d",
+    image_id:
+      "sha256:72c50742eb507648d40372108a020bac0503333084a7921d83bb8d91c7e4c100",
+    restart_policy: "Never",
+    args: ["sh", "/server/bin/init_server_basic"],
+  };
+
+  test("releases when the recomputed measurement is in the allowlist", () => {
+    setGcpClaims({ container_measurement: [measurementOf(CONTAINER)] });
+    const result = validateGcpAttestation(gcpTokenWithContainer(CONTAINER));
+    expect(result.success).toBe(true);
+  });
+
+  test("rejects when the measurement is not in the allowlist", () => {
+    setGcpClaims({ container_measurement: [measurementOf(CONTAINER)] });
+    // A different image digest -> different measurement -> no match.
+    const tampered = { ...CONTAINER, image_digest: "sha256:deadbeef" };
+    const result = validateGcpAttestation(gcpTokenWithContainer(tampered));
+    expect(result.success).toBe(false);
+    expect(result.statusCode).toBe(400);
+  });
+
+  test("supports an allowlist of several images (multi-service)", () => {
+    const other = { ...CONTAINER, image_digest: "sha256:other", args: ["/kv"] };
+    setGcpClaims({
+      container_measurement: [measurementOf(CONTAINER), measurementOf(other)],
+    });
+    expect(
+      validateGcpAttestation(gcpTokenWithContainer(other)).success,
+    ).toBe(true);
+  });
+
+  test("enforces dbgstat posture (debug-enabled token rejected)", () => {
+    setGcpClaims({
+      container_measurement: [measurementOf(CONTAINER)],
+      dbgstat: ["disabled-since-boot"],
+    });
+    const debugTok = gcpTokenWithContainer(CONTAINER, { dbgstat: "enabled" });
+    const result = validateGcpAttestation(debugTok);
+    expect(result.success).toBe(false);
+    expect(result.statusCode).toBe(400);
+  });
+
+  test("passes dbgstat posture when the token is hardened", () => {
+    setGcpClaims({
+      container_measurement: [measurementOf(CONTAINER)],
+      dbgstat: ["disabled-since-boot"],
+    });
+    const hardened = gcpTokenWithContainer(CONTAINER, {
+      dbgstat: "disabled-since-boot",
+    });
+    expect(validateGcpAttestation(hardened).success).toBe(true);
+  });
+
+  test("enforces secboot posture (secboot=false rejected)", () => {
+    setGcpClaims({
+      container_measurement: [measurementOf(CONTAINER)],
+      secboot: ["true"],
+    });
+    const noSecboot = gcpTokenWithContainer(CONTAINER, { secboot: false });
+    const result = validateGcpAttestation(noSecboot);
+    expect(result.success).toBe(false);
+    expect(result.statusCode).toBe(400);
+  });
+
+  test("passes secboot posture when secboot=true", () => {
+    setGcpClaims({
+      container_measurement: [measurementOf(CONTAINER)],
+      secboot: ["true"],
+    });
+    const secure = gcpTokenWithContainer(CONTAINER, { secboot: true });
+    expect(validateGcpAttestation(secure).success).toBe(true);
   });
 });

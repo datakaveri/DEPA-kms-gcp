@@ -1,11 +1,25 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+import { ccf } from "@microsoft/ccf-app/global";
 import { ServiceResult } from "../utils/ServiceResult";
 import { IAttestationReport } from "./ISnpAttestationReport";
 import { gcpKeyReleasePolicyMap } from "../repositories/Maps";
 import { KeyReleasePolicy } from "../policies/KeyReleasePolicy";
+import { canonicalContainerString } from "./containerMeasurement";
 import { Logger, LogContext } from "../utils/Logger";
+
+/**
+ * SHA-256 of a string as a lowercase hex digest, using the same primitive and
+ * encoding the rest of the app uses (see endpoints/proposals.ts). Kept identical
+ * to the Node registration CLI, which hashes the UTF-8 bytes of the same string.
+ */
+const sha256Hex = (value: string): string =>
+  Array.from(
+    new Uint8Array(ccf.crypto.digest("SHA-256", ccf.strToBuf(value))),
+  )
+    .map((n) => n.toString(16).padStart(2, "0"))
+    .join("");
 
 /**
  * Validates a GCP Confidential Space workload against the GCP key release policy.
@@ -63,6 +77,25 @@ const extractGcpClaims = (payload: {
     set("image_digest", container.image_digest); // "sha256:..."
     set("image_reference", container.image_reference);
     set("restart_policy", container.restart_policy);
+
+    // container_measurement: a compact, hostdata-style SHA-256 over the stable
+    // container identity (image_digest + image_id + restart_policy + args),
+    // recomputed here from the token and matched against the registered
+    // allowlist. This is the GCP analog of Azure `x-ms-sevsnpvm-hostdata`:
+    // instead of a sprawl of individual claims, one hex value per image. The
+    // canonical string is shared with the offline registration CLI so both
+    // sides hash identical bytes (see attestation/containerMeasurement.ts).
+    set(
+      "container_measurement",
+      sha256Hex(
+        canonicalContainerString({
+          image_digest: container.image_digest,
+          image_id: container.image_id,
+          restart_policy: container.restart_policy,
+          args: container.args,
+        }),
+      ),
+    );
   }
 
   // Confidential Space support attributes (submods.confidential_space).

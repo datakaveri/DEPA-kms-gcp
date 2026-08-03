@@ -24,6 +24,18 @@ export let action = [
           // the trusted-image allowlist. Until entries are added, GcpAttestation-
           // Validation treats an empty policy as "any image allowed".
           image_digest: "string",
+          // container_measurement: a compact SHA-256 fingerprint of the stable
+          // container identity (image_digest + image_id + restart_policy + args),
+          // computed by attestation/containerMeasurement.ts. This is the GCP
+          // analog of Azure "x-ms-sevsnpvm-hostdata" - one hex value per image
+          // instead of a sprawl of container claims.
+          container_measurement: "string",
+          // Hardware / launcher posture (top-level CS token claims), the GCP
+          // analog of Azure's separate SNP posture flags alongside hostdata.
+          // dbgstat should pin the hardened value in prod ("disabled-since-boot")
+          // and secboot must be "true". Non-prod (UAT) may allow "enabled".
+          dbgstat: "string",
+          secboot: "string",
         };
         // Function to add key release policy claims
         const add = (type, claims) => {
